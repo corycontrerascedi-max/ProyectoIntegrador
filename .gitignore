@@ -7,4 +7,4 @@ __pycache__/
 
 # Windows
 Thumbs.db
-desktop.ini
+assets/datasets/*.npz
