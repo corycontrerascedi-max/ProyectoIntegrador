@@ -17,9 +17,10 @@ from model import Net
 # --- CONFIGURACIÓN ---
 BATCH_SIZE = 128
 LR = 0.001
-EPOCHS = 10 
+EPOCHS = 15 # Aumenté un poco las épocas porque ahora es más difícil aprender
+# (Nota: Puedes bajarlo a 10 si tienes prisa, pero 15 dará mejor resultado)
 
-# --- RUTAS DINÁMICAS (Para que no falle por carpetas) ---
+# --- RUTAS DINÁMICAS ---
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE_PATH = os.path.join(base_dir, 'assets', 'models', 'modelo_base_colon.pth')
 TARGET_PATH = os.path.join(base_dir, 'assets', 'models', 'modelo_final_piel.pth')
@@ -45,7 +46,7 @@ def plot_training_results(loss_list, acc_list):
     plt.grid(True)
     
     plt.savefig('training_curves.png')
-    print("Gráficas de entrenamiento guardadas como 'training_curves.png'")
+    print("📈 Gráficas de entrenamiento guardadas como 'training_curves.png'")
     plt.close()
 
 def plot_confusion_matrix(y_true, y_pred, classes):
@@ -57,69 +58,106 @@ def plot_confusion_matrix(y_true, y_pred, classes):
     plt.ylabel('Realidad (Biopsia)')
     plt.title('Matriz de Confusión - Diagnóstico Dermatológico')
     plt.savefig('confusion_matrix.png')
-    print("Matriz de confusión guardada como 'confusion_matrix.png'")
+    print("📊 Matriz de confusión guardada como 'confusion_matrix.png'")
     plt.close()
 
 def train_target():
     print(f"--- INICIANDO FASE 2: TRANSFER LEARNING (CROSSPATH AI) ---")
-    print(f"Buscando modelo base en: {SOURCE_PATH}")
+    print(f"🔍 Buscando modelo base en: {SOURCE_PATH}")
     
     if not os.path.exists(SOURCE_PATH):
-        print(f"ERROR: No encuentro el archivo. Verifica la ruta.")
+        print(f"❌ ERROR: No encuentro el archivo. Verifica la ruta.")
         return
 
     # Preparar Datos
     data_flag = 'dermamnist'
     info = INFO[data_flag]
-    # Calculamos clases manualmente para evitar errores
     n_classes_piel = len(info['label'])
     
-    print(f"Dataset: {data_flag} | Clases destino: {n_classes_piel}")
+    print(f"📊 Dataset: {data_flag} | Clases destino: {n_classes_piel}")
 
-    data_transform = transforms.Compose([
+    # ### --- CAMBIO 1: DATA AUGMENTATION ---
+    # Hacemos el entrenamiento más difícil rotando y volteando imágenes
+    # para que la IA no memorice posiciones.
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),      # Voltear horizontalmente
+        transforms.RandomVerticalFlip(),        # Voltear verticalmente
+        transforms.RandomRotation(20),          # Rotar hasta 20 grados
+        transforms.ColorJitter(brightness=0.1), # Jugar un poco con el brillo
         transforms.ToTensor(),
         transforms.Normalize(mean=[.5], std=[.5])
     ])
 
-    train_dataset = medmnist.DermaMNIST(split='train', transform=data_transform, download=True, root='./assets/datasets')
-    test_dataset = medmnist.DermaMNIST(split='test', transform=data_transform, download=True, root='./assets/datasets')
+    # Para el test NO alteramos la imagen, solo la normalizamos
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[.5], std=[.5])
+    ])
+
+    train_dataset = medmnist.DermaMNIST(split='train', transform=train_transform, download=True, root='./assets/datasets')
+    test_dataset = medmnist.DermaMNIST(split='test', transform=test_transform, download=True, root='./assets/datasets')
     
     train_loader = DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(dataset=test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
     # --- CARGAR EL CEREBRO ---
-    print("Cargando modelo pre-entrenado...")
-    
-    # CORRECCIÓN 1: Usamos 'num_classes' que es lo que pide tu model.py
-    # Y quitamos n_channels porque tu modelo no lo pide.
+    print("🧠 Cargando modelo pre-entrenado...")
     model = Net(num_classes=9) 
     
     try:
         model.load_state_dict(torch.load(SOURCE_PATH))
-        print("Pesos de Colon cargados exitosamente.")
+        print("✅ Pesos de Colon cargados exitosamente.")
     except Exception as e:
-        print(f"Error al cargar pesos: {e}")
+        print(f"❌ Error al cargar pesos: {e}")
         return
 
     # Congelar capas (Freeze)
     for param in model.parameters():
         param.requires_grad = False
 
-    # --- CIRUGÍA DE MODELO (CORRECCIÓN 2) ---
-    # Tu capa final se llama 'fc2', así que esa es la que reemplazamos.
-    print(f"Reemplazando capa final 'fc2' (9 -> {n_classes_piel} neuronas)...")
-    
+    # --- CIRUGÍA DE MODELO ---
+    print(f"🔧 Reemplazando capa final 'fc2' (9 -> {n_classes_piel} neuronas)...")
     num_ftrs = model.fc2.in_features
     model.fc2 = nn.Linear(num_ftrs, n_classes_piel)
 
     # Entrenamos solo lo que no está congelado
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
-    criterion = nn.CrossEntropyLoss()
+
+    # ### --- CAMBIO 2: CLASS WEIGHTS (CASTIGO PONDERADO) ---
+    print("⚖️ Calculando pesos para balancear el castigo...")
+    
+    # Extraemos todas las etiquetas del entrenamiento para contarlas
+    # Nota: DermaMNIST guarda las etiquetas en .labels (array numpy)
+    # Si falla, usamos el método de iteración, pero este debería ser directo.
+    try:
+        targets_np = train_dataset.labels.squeeze()
+    except:
+        # Método alternativo seguro si .labels falla
+        temp_list = []
+        for _, t in train_dataset:
+            temp_list.append(t[0])
+        targets_np = np.array(temp_list)
+
+    class_counts = np.bincount(targets_np)
+    
+    # Fórmula: Peso = Total / (Num_Clases * Cantidad_de_esa_Clase)
+    # Resultado: Las clases raras tienen números más grandes
+    total_samples = sum(class_counts)
+    class_weights = total_samples / (n_classes_piel * class_counts)
+    
+    # Convertimos a Tensor
+    weights_tensor = torch.FloatTensor(class_weights)
+    print(f"   Pesos asignados: {np.round(class_weights, 2)}")
+    print("   (Las clases con números altos son las que la IA priorizará)")
+
+    # Aplicamos los pesos al criterio
+    criterion = nn.CrossEntropyLoss(weight=weights_tensor)
+    # ### ----------------------------------------------------
 
     loss_history = []
     acc_history = []
 
-    print("\n --- ENTRENANDO ---")
+    print("\n🚀 --- ENTRENANDO (VERSIÓN BALANCEADA) ---")
     model.train()
     
     for epoch in range(EPOCHS):
@@ -151,13 +189,13 @@ def train_target():
 
     # Guardar
     torch.save(model.state_dict(), TARGET_PATH)
-    print(f"\n Modelo guardado en: {TARGET_PATH}")
+    print(f"\n💾 Modelo guardado en: {TARGET_PATH}")
     
     # Gráficas
-    print("\n Generando gráficas científicas...")
+    print("\n🎨 Generando gráficas científicas...")
     plot_training_results(loss_history, acc_history)
 
-    print("Generando Matriz de Confusión...")
+    print("🔍 Generando Matriz de Confusión...")
     all_preds = []
     all_targets = []
     model.eval()
@@ -172,7 +210,7 @@ def train_target():
     labels_humanos = ['Actinic', 'BCC', 'Benign', 'Dermato', 'Melanoma', 'Nevus', 'Vasc']
     plot_confusion_matrix(all_targets, all_preds, labels_humanos)
 
-    print("\n ¡FASE 2 COMPLETADA! Revisa las imágenes PNG en tu carpeta.")
+    print("\n✨ ¡FASE 2 COMPLETADA! Revisa 'confusion_matrix.png'.")
 
 if __name__ == '__main__':
     train_target()
