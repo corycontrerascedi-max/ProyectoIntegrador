@@ -1,100 +1,116 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim  # Herramientas para ajustar los pesos (aprender)
+import torch.optim as optim
 import torch.utils.data as data
 import torchvision.transforms as transforms
 import medmnist
 from medmnist import INFO
-from model import Net  # Importamos el "cerebro" que definimos en el otro archivo
 import os
 
+# Importamos la arquitectura de red neuronal definida en el paso anterior
+from model import Net
+
 def train_source():
-    print("--- Entrenando Modelo Base (Colon) ---")
+    print("Iniciando entrenamiento del Modelo Base (Dominio Fuente: Colon)...")
     
-    # 1. DETECCIÓN DE HARDWARE
-    # Revisa si tienes tarjeta gráfica NVIDIA (cuda). Si sí, la usa para ir rápido.
-    # Si no, usa el procesador (cpu), que es más lento pero funciona en cualquier compu.
+    # 1. CONFIGURACION DE HARDWARE
+    # Verificamos si existe disponibilidad de GPU (CUDA) para acelerar el calculo matricial
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Usando dispositivo: {device}")
+    print(f"Dispositivo de procesamiento seleccionado: {device}")
     
-    # 2. PREPARACIÓN DE DATOS
-    info = INFO['pathmnist'] # Carga la info específica del dataset de Colon
+    # 2. PREPARACION DE DATOS Y PRE-PROCESAMIENTO
+    # Cargamos la informacion del dataset PathMNIST (Colon)
+    data_flag = 'pathmnist'
+    info = INFO[data_flag]
+    num_classes = len(info['label']) # Obtenemos el numero de clases (9 tipos de tejido)
     
-    # Definimos cómo transformar las imágenes antes de que la IA las vea
+    # Definimos la cadena de transformaciones (Pipeline)
+    # Fuente: Shorten & Khoshgoftaar (2019) - La normalizacion acelera la convergencia del descenso de gradiente
     data_transform = transforms.Compose([
-        transforms.ToTensor(), # Convierte imagen (JPG) a matriz matemática (Tensor)
-        transforms.Normalize(mean=[.5], std=[.5]) # Escala valores entre -1 y 1 (ayuda matemática)
+        transforms.ToTensor(), # Convierte imagen a Tensor de PyTorch (Float32)
+        transforms.Normalize(mean=[0.5], std=[0.5]) # Normaliza los valores de pixeles al rango [-1, 1]
     ])
     
     root = './assets/datasets'
     
-    # Crea la carpeta si no existe para evitar errores
-    if not os.path.exists(root):
-        os.makedirs(root)
-        
-    print("Cargando dataset...")
-    # Descarga PathMNIST automáticamente si no lo tienes
+    # Cargamos el dataset de entrenamiento
+    print("Cargando dataset PathMNIST...")
     train_dataset = medmnist.PathMNIST(split='train', transform=data_transform, download=True, root=root)
     
-    # El DataLoader es el "cargador". Agarra 128 imágenes, las revuelve (shuffle) 
-    # y se las da a la IA en paquetes para no llenar la memoria RAM.
+    # Configuramos el DataLoader
+    # Batch Size 128: Procesamos 128 imagenes simultaneamente para estimar el gradiente
     train_loader = data.DataLoader(dataset=train_dataset, batch_size=128, shuffle=True)
 
-    # 3. INICIAR EL MODELO
-    print("Iniciando modelo...")
-    # Crea una instancia de tu red neuronal y la manda a la GPU/CPU
-    model = Net(num_classes=len(info['label'])).to(device)
+    # 3. INSTANCIACION DEL MODELO
+    print(f"Inicializando red neuronal para {num_classes} clases...")
+    model = Net(num_classes=num_classes)
+    model.to(device) # Movemos el modelo a la memoria de la GPU/CPU
     
-    criterion = nn.CrossEntropyLoss() # La regla para medir el error (Loss)
-    optimizer = optim.Adam(model.parameters(), lr=0.001) # El algoritmo que ajusta las neuronas
+    # 4. DEFINICION DE HIPERPARAMETROS
+    # Funcion de Perdida: CrossEntropyLoss
+    # Fuente: Rubinstein (1999) - Estandar para clasificacion multiclase, penaliza logaritmicamente el error
+    criterion = nn.CrossEntropyLoss()
+    
+    # Optimizador: Adam (Adaptive Moment Estimation)
+    # Fuente: Kingma & Ba (2014) - Ajusta la tasa de aprendizaje automaticamente por parametro
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-    # 4. BUCLE DE ENTRENAMIENTO (Aquí aprende)
-    EPOCHS = 3 # Cuántas veces repasará el libro completo (todas las imágenes)
+    # 5. BUCLE DE ENTRENAMIENTO (TRAINING LOOP)
+    EPOCHS = 3 # Numero de veces que el modelo vera todo el dataset
     
     for epoch in range(EPOCHS):
-        model.train() # Activa el "modo aprendizaje" (habilita capas especiales)
+        model.train() # Ponemos el modelo en modo entrenamiento (habilita BatchNorm y Dropout)
         running_loss = 0.0
         correct = 0
         total = 0
         
-        # Bucle interno: Procesa lote por lote (batch)
+        # Iteramos sobre los lotes de datos
         for inputs, targets in train_loader:
-            # Mover datos a la tarjeta gráfica
+            # Enviamos datos al dispositivo
             inputs, targets = inputs.to(device), targets.to(device)
-            targets = targets.squeeze().long() # Ajuste de formato de etiquetas
             
-            # A. Limpiar memoria: Borra los cálculos del paso anterior
+            # Las etiquetas en MedMNIST vienen como [Batch, 1], necesitamos [Batch]
+            targets = targets.squeeze().long()
+            
+            # PASO A: Reiniciar gradientes
+            # Borramos los gradientes calculados en la iteracion anterior
             optimizer.zero_grad()
             
-            # B. Examen: La IA intenta adivinar qué es la imagen
+            # PASO B: Inferencia (Forward Pass)
+            # Calculamos la prediccion del modelo
             outputs = model(inputs)
             
-            # C. Calificación: Compara la predicción con la realidad
+            # PASO C: Calculo de error (Loss)
             loss = criterion(outputs, targets)
             
-            # D. Aprendizaje (Backpropagation): Calcula quién tuvo la culpa del error
+            # PASO D: Retropropagacion (Backpropagation)
+            # Calculamos la derivada del error respecto a cada peso
+            # Fuente: Rumelhart et al. (1986)
             loss.backward()
             
-            # E. Ajuste: Actualiza los pesos de las neuronas para mejorar
+            # PASO E: Optimizacion
+            # Actualizamos los pesos restando el gradiente multiplicado por el learning rate
             optimizer.step()
             
-            # Cálculos estadísticos (para ver el progreso en pantalla)
+            # Calculo de metricas para monitoreo
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
             
-        # Al final de cada época, imprimimos el reporte
+        # Reporte de progreso al final de la epoca
         acc = 100. * correct / total
-        print(f"Epoca {epoch+1}/{EPOCHS} -> Loss: {running_loss/len(train_loader):.4f} | Acc: {acc:.2f}%")
+        avg_loss = running_loss / len(train_loader)
+        print(f"Epoca [{epoch+1}/{EPOCHS}] -> Perdida: {avg_loss:.4f} | Precision: {acc:.2f}%")
 
-    # 5. GUARDAR RESULTADOS
-    if not os.path.exists('./assets/models'):
-        os.makedirs('./assets/models')
+    # 6. EXPORTACION DEL MODELO
+    output_dir = './assets/models'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     
-    # Guardamos el "state_dict" (los conocimientos adquiridos), no el código entero
-    torch.save(model.state_dict(), './assets/models/modelo_base_colon.pth')
-    print("✅ Modelo guardado.")
+    save_path = os.path.join(output_dir, 'modelo_base_colon.pth')
+    torch.save(model.state_dict(), save_path)
+    print(f"Modelo entrenado guardado exitosamente en: {save_path}")
 
 if __name__ == '__main__':
     train_source()

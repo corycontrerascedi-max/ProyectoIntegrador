@@ -1,70 +1,88 @@
 import torch
 import torch.nn as nn
 import os
-import onnx
+import onnx # Libreria estandar para el intercambio de redes neuronales
 
-# Importamos tu arquitectura
+# Importamos la definicion de la arquitectura
 from model import Net
 
-# --- RUTAS ---
-base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Ruta del modelo entrenado (Piel)
-MODEL_PATH = os.path.join(base_dir, 'assets', 'models', 'modelo_final_piel.pth')
-# Ruta donde guardaremos el archivo optimizado
-ONNX_PATH = os.path.join(base_dir, 'assets', 'models', 'crosspath_ai.onnx')
+# --- CONFIGURACION DE RUTAS ---
+# Usamos rutas relativas para que funcione en cualquier computadora
+base_dir = './assets'
+model_dir = os.path.join(base_dir, 'models')
+
+# Ruta de entrada (Modelo PyTorch .pth entrenado)
+MODEL_PATH = os.path.join(model_dir, 'modelo_final_piel.pth')
+# Ruta de salida (Modelo optimizado .onnx)
+ONNX_PATH = os.path.join(model_dir, 'crosspath_ai.onnx')
 
 def export_to_onnx():
-    print("--- INICIANDO EXPORTACIÓN A ONNX ---")
+    print("Iniciando proceso de exportacion a ONNX (Open Neural Network Exchange)...")
     
-    # 1. RECONSTRUIR LA ARQUITECTURA EXACTA
-    # Recuerda: Tu modelo nació con 9 clases (Colon) y luego le operamos la capa final a 7 (Piel).
-    # Debemos repetir esos pasos para que los pesos encajen.
+    # 1. RECONSTRUCCION DE LA ARQUITECTURA
+    # Debemos recrear exactamente la misma estructura que tenia el modelo al momento de guardarse.
+    # El modelo nacio con 9 clases (Colon) y se modifico a 7 (Piel).
     
-    print("Reconstruyendo arquitectura del modelo...")
-    # Paso A: Crear base original
-    model = Net(num_classes=9) 
+    print("Inicializando esqueleto del modelo...")
+    # Paso A: Instanciar modelo base
+    model = Net(num_classes=9)
     
-    # Paso B: Reemplazar la capa final por la de 7 clases (igual que en el entrenamiento)
-    # NOTA: En DermaMNIST hay 7 clases.
-    n_classes_piel = 7 
+    # Paso B: Replicar la modificacion de la ultima capa (Transfer Learning)
+    n_classes_piel = 7
     num_ftrs = model.fc2.in_features
     model.fc2 = nn.Linear(num_ftrs, n_classes_piel)
     
-    # 2. CARGAR LOS PESOS ENTRENADOS
+    # 2. CARGA DE PESOS (STATE DICT)
     print(f"Cargando pesos desde: {MODEL_PATH}")
+    
     if not os.path.exists(MODEL_PATH):
-        print("ERROR: No encuentro el modelo .pth. ¿Ya corriste la Fase 2?")
+        print("ERROR CRITICO: No se encontro el archivo .pth. Verifique haber ejecutado train_target.py.")
         return
 
     try:
+        # Cargamos los tensores de pesos en la arquitectura
         model.load_state_dict(torch.load(MODEL_PATH))
-        model.eval() # Poner en modo evaluación (apaga Dropout, congela Batchnorm)
-        print("Pesos cargados correctamente.")
+        
+        # IMPORTANTE: Cambiar a modo evaluacion
+        # Esto desactiva capas aleatorias como Dropout y fija las estadisticas de BatchNorm.
+        # Si no se hace, el modelo ONNX dara resultados erraticos.
+        model.eval()
+        print("Pesos cargados y modelo fijado en modo EVAL.")
+        
     except Exception as e:
-        print(f"Error al cargar state_dict: {e}")
+        print(f"Error cargando el modelo: {str(e)}")
         return
 
-    # 3. CREAR UN DATO "FANTASMA" (DUMMY INPUT)
-    # ONNX necesita ver pasar una foto de prueba para entender el camino de las neuronas.
-    # Formato: [Batch=1, Canales=3, Alto=28, Ancho=28] (Tamaño estándar MedMNIST)
+    # 3. TRAZADO DEL GRAFO (TRACING)
+    # ONNX funciona "viendo" pasar un dato a traves de la red para mapear las operaciones.
+    # Creamos un tensor aleatorio con las dimensiones esperadas: [Batch, Canales, Alto, Ancho]
+    # MedMNIST usa imagenes de 28x28 pixeles.
     dummy_input = torch.randn(1, 3, 28, 28)
 
-    # 4. EXPORTAR
-    print(f"Exportando a: {ONNX_PATH}")
+    # 4. EXPORTACION
+    print(f"Generando archivo optimizado en: {ONNX_PATH}")
+    
     torch.onnx.export(
-        model,                      # El modelo
-        dummy_input,                # El dato fantasma
-        ONNX_PATH,                  # Dónde guardar
-        export_params=True,         # Guardar los pesos entrenados dentro del archivo
-        opset_version=11,           # Versión compatible con Raspberry Pi
-        do_constant_folding=True,   # Optimización matemática (hace el modelo más rápido)
-        input_names=['input'],      # Nombre de la entrada (lo usaremos en la App)
-        output_names=['output'],    # Nombre de la salida (lo usaremos en la App)
-        dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}} # Permitir varios tamaños de batch
+        model,                  # El modelo de PyTorch
+        dummy_input,            # El dato de ejemplo (Dummy Input)
+        ONNX_PATH,              # Ruta de guardado
+        export_params=True,     # Almacenar los pesos entrenados dentro del archivo
+        opset_version=11,       # Version del set de operaciones (11 es muy estable para Raspberry)
+        do_constant_folding=True, # Optimizacion: Pre-calcula operaciones constantes para acelerar inferencia
+        input_names=['input'],  # Nombre del nodo de entrada (util para debug)
+        output_names=['output'], # Nombre del nodo de salida
+        dynamic_axes={          # Permitir tamaño de lote variable (util para procesar varias fotos a la vez)
+            'input': {0: 'batch_size'}, 
+            'output': {0: 'batch_size'}
+        }
     )
 
-    print("\n Tu modelo 'crosspath_ai.onnx' está listo.")
-    print("   Este es el archivo que copiarás a la Raspberry Pi.")
+    print("\n--- EXPORTACION EXITOSA ---")
+    print(f"Archivo generado: {ONNX_PATH}")
+    print("Instrucciones: Copie este archivo a la carpeta del proyecto en la Raspberry Pi.")
 
 if __name__ == '__main__':
+    # Crear carpeta si no existe
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
     export_to_onnx()
